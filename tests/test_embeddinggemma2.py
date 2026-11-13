@@ -308,6 +308,65 @@ def test_mps_batch_failure_retries_same_batch_once_on_cpu(monkeypatch):
     assert len(vectors) == 1
 
 
+def test_mps_failure_keeps_mps_model_primary(monkeypatch):
+    provider = EmbeddingGemma2EmbeddingFunction(device="auto")
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            backends=SimpleNamespace(mps=SimpleNamespace(is_available=lambda: True)),
+        ),
+    )
+    devices = []
+    failed_once = []
+
+    def mps_fails_one_query(texts, _kwargs):
+        if texts[0] != "mempalace embedding provider health check" and not failed_once:
+            failed_once.append(texts[0])
+            raise RuntimeError("MPS runtime operation failed")
+        return None
+
+    models = {"mps": _FakeModel(behavior=mps_fails_one_query), "cpu": _FakeModel()}
+
+    def load(device):
+        devices.append(device)
+        return models[device]
+
+    monkeypatch.setattr(provider, "_load_model_for", load)
+    with pytest.warns(RuntimeWarning, match="retrying this batch on CPU"):
+        vectors = provider.embed_query(["over the limit"])
+    assert len(vectors) == 1
+    # The retry must not park the provider on CPU: one failed batch must not
+    # leave a second, resident model behind for the rest of the server's life.
+    assert provider.effective_device == "mps"
+    assert provider._model is models["mps"]
+    vectors = provider.embed_query(["healthy next query"])
+    assert provider._model is models["mps"]
+    assert devices == ["mps", "cpu"]  # no third load for the later query
+    assert models["mps"].calls[-1][0] == ["healthy next query"]
+    assert len(vectors) == 1
+
+
+def test_mps_cache_is_released_after_each_encode(monkeypatch):
+    releases = []
+    provider = EmbeddingGemma2EmbeddingFunction(device="auto")
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            backends=SimpleNamespace(mps=SimpleNamespace(is_available=lambda: True)),
+            mps=SimpleNamespace(empty_cache=lambda: releases.append(1)),
+        ),
+    )
+    model = _FakeModel()
+    monkeypatch.setattr(provider, "_load_model_for", lambda _device: model)
+    provider.embed_query(["first"])
+    provider.embed_query(["second"])
+    # torch's MPS caching allocator keeps every encode shape's blocks forever;
+    # a long-lived server grows without bound unless each encode releases them.
+    assert len(releases) == 2
+
+
 @pytest.mark.parametrize("media_type", ["image", "video"])
 def test_corrupt_media_runtime_error_keeps_healthy_mps_model(
     monkeypatch, tmp_path, caplog, media_type

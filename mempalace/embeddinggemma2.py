@@ -428,6 +428,15 @@ class EmbeddingGemma2EmbeddingFunction:
         except Exception:  # noqa: BLE001 - best effort between retries
             pass
 
+    @staticmethod
+    def _empty_mps_cache() -> None:
+        try:
+            import torch
+
+            torch.mps.empty_cache()
+        except Exception:  # noqa: BLE001 - best effort, and not every build has MPS
+            pass
+
     def _encode_shrinking_on_oom(self, inputs, *, prompt_name=None, prompt=None):
         """Encode; on a CUDA out-of-memory error, halve the batch and retry, down to 1.
 
@@ -500,6 +509,7 @@ class EmbeddingGemma2EmbeddingFunction:
                     self._warn_mps_fallback("model initialization", exc)
                     model = self._load_model_for("cpu")
                     selected = "cpu"
+                    self._empty_mps_cache()  # release the half-initialized model's blocks
             else:
                 model = self._load_model_for(selected)
             self._model = model
@@ -517,6 +527,7 @@ class EmbeddingGemma2EmbeddingFunction:
                     cpu_model = self._load_model_for("cpu")
                     self._model = cpu_model
                     self._resolved_device = "cpu"
+                    self._empty_mps_cache()  # release the rejected model's blocks
 
     def _encode(self, inputs, *, prompt_name=None, prompt=None):
         if not inputs:
@@ -527,7 +538,9 @@ class EmbeddingGemma2EmbeddingFunction:
             # witness has proved the provider healthy.
             self._load_and_check()
             try:
-                return self._encode_shrinking_on_oom(inputs, prompt_name=prompt_name, prompt=prompt)
+                vectors = self._encode_shrinking_on_oom(
+                    inputs, prompt_name=prompt_name, prompt=prompt
+                )
             except (RuntimeError, EmbeddingOutputError) as exc:
                 if self._resolved_device != "mps":
                     raise
@@ -546,11 +559,23 @@ class EmbeddingGemma2EmbeddingFunction:
                     RuntimeWarning,
                     stacklevel=2,
                 )
-                cpu_model = self._load_model_for("cpu")
-                self._model = cpu_model
-                self._resolved_device = "cpu"
-                # Retry exactly once. CPU failures are deliberately propagated.
-                return self._encode_once(inputs, prompt_name=prompt_name, prompt=prompt)
+                self._empty_mps_cache()
+                # Retry exactly once on a temporary CPU model; CPU failures are
+                # deliberately propagated. The MPS model stays primary: a
+                # permanent switch parked a second, multi-GB model in every
+                # later call of a long-lived server.
+                mps_model = self._model
+                try:
+                    self._model = self._load_model_for("cpu")
+                    return self._encode_once(inputs, prompt_name=prompt_name, prompt=prompt)
+                finally:
+                    self._model = mps_model
+            if self._resolved_device == "mps":
+                # torch's MPS caching allocator keeps every encode shape's blocks
+                # forever, so a long-lived server grows without bound (measured
+                # 2.1→10.3 GB over 11 embeds).
+                self._empty_mps_cache()
+            return vectors
 
     def embed_documents(self, input: str | list[str], metadatas: Optional[list[dict]] = None):
         texts = _as_texts(input)
