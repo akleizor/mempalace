@@ -345,11 +345,15 @@ class EmbeddingGemma2EmbeddingFunction:
                 "transformers>=5.19.0, and torch. Install the EmbeddingGemma 2 extra."
             ) from exc
 
+        # The checkpoint ships bf16 weights, so fp32 doubles resident memory for
+        # no information gain: a long-lived read-only hub peaked at 5.6 GB fp32
+        # against 2.4 GB bf16 on Apple Silicon and the OS jetsam-killed for
+        # memory. Embeddings match fp32 to cosine >= 0.999 on MPS.
         model = SentenceTransformer(
             MODEL_ID,
             device=device,
             revision=self.revision,
-            model_kwargs={"dtype": torch.float32},
+            model_kwargs={"dtype": torch.bfloat16},
             config_kwargs=_config_kwargs(self.modalities),
         )
         _cap_max_seq_length(model)

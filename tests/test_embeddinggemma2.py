@@ -94,11 +94,14 @@ def test_rejects_unsupported_devices(device):
         EmbeddingGemma2EmbeddingFunction(device=device)
 
 
-def test_model_load_is_lazy_and_uses_pinned_revision_float32(monkeypatch):
+def test_model_load_is_lazy_and_uses_pinned_revision_bfloat16(monkeypatch):
+    # bf16, not fp32: the checkpoint ships bf16 weights, so fp32 doubles
+    # resident memory for no quality gain (cosine >= 0.999 vs fp32 on MPS)
+    # and jetsam-killed a long-lived read-only hub's Mac at 5.6 GB.
     captured = {}
 
     class _Torch:
-        float32 = "float32"
+        bfloat16 = "bfloat16"
 
     class _SentenceTransformer:
         def __init__(self, model_id, **kwargs):
@@ -118,7 +121,7 @@ def test_model_load_is_lazy_and_uses_pinned_revision_float32(monkeypatch):
     assert captured["kwargs"] == {
         "device": "cpu",
         "revision": DEFAULT_REVISION,
-        "model_kwargs": {"dtype": "float32"},
+        "model_kwargs": {"dtype": "bfloat16"},
         "config_kwargs": {"audio_config": None},
     }
 
