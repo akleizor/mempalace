@@ -1028,18 +1028,24 @@ def tool_mine(
 
 
 def _return_freed_heap_to_os() -> None:
-    """Ask glibc to hand freed heap pages back to the OS.
+    """Ask the C allocator to hand freed heap pages back to the OS.
 
     A mine frees a large amount of memory when it ends: its scans, its write
     buffers, the client it closes. glibc keeps most of that in its arenas, so
     a long-lived server's resident size stays near the mine's peak instead of
-    returning to where it started. No-op where there is no ``malloc_trim``
-    (musl, macOS, Windows).
+    returning to where it started. Darwin has no ``malloc_trim``: its malloc
+    zones release the same free pages through ``malloc_zone_pressure_relief``
+    (a NULL zone means every zone). No-op where neither exists (musl, Windows).
     """
     try:
         import ctypes
+        import sys
 
-        ctypes.CDLL(None).malloc_trim(0)
+        libc = ctypes.CDLL(None)
+        if sys.platform == "darwin":
+            libc.malloc_zone_pressure_relief(None, 0)
+        else:
+            libc.malloc_trim(0)
     except Exception:
         pass
 

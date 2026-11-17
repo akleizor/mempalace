@@ -692,3 +692,31 @@ def test_return_freed_heap_never_raises(monkeypatch):
     monkeypatch.setattr(ctypes, "CDLL", no_libc)
 
     mcp_server._return_freed_heap_to_os()
+
+
+@pytest.mark.parametrize(
+    "platform,called", [("darwin", "malloc_zone_pressure_relief"), ("linux", "malloc_trim")]
+)
+def test_return_freed_heap_uses_the_platforms_release_call(monkeypatch, platform, called):
+    """Darwin releases free malloc zones; the malloc_trim path is glibc-only.
+
+    Without the darwin branch the helper was a silent no-op on macOS and a
+    long-lived server kept a mine's freed pages resident.
+    """
+    import ctypes
+    import sys
+
+    from mempalace import mcp_server
+
+    calls = []
+
+    class FakeLibc:
+        def __getattr__(self, name):
+            return lambda *args: calls.append((name, args))
+
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(ctypes, "CDLL", lambda *_args, **_kwargs: FakeLibc())
+
+    mcp_server._return_freed_heap_to_os()
+
+    assert calls == [(called, (None, 0) if called == "malloc_zone_pressure_relief" else (0,))]
