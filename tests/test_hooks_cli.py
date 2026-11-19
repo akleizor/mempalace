@@ -3146,3 +3146,30 @@ def test_ingest_transcript_passes_the_project_wing_to_mine(tmp_path, monkeypatch
     )
     hooks_cli._ingest_transcript(path)
     assert jobs and jobs[0]["wing"] == "mempalace"
+
+
+def test_spawn_mine_runs_one_mine_per_palace_and_queues_the_rest(tmp_path):
+    """A mine for another target waits while any mine is live, then runs first in line."""
+    import time as _time
+
+    pid_dir = tmp_path / "mine_pids"
+    a = ["mempalace", "mine", "/tmp/a.jsonl", "--mode", "convos"]
+    b = ["mempalace", "mine", "/tmp/b.jsonl", "--mode", "convos"]
+    c = ["mempalace", "mine", "/tmp/c.jsonl", "--mode", "convos"]
+    with (
+        patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
+        patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir),
+        patch("mempalace.hooks_cli.subprocess.Popen") as popen,
+    ):
+        from mempalace.hooks_cli import _pid_file_for_cmd, _spawn_mine
+
+        popen.return_value.pid = os.getpid()  # a live pid holds the slot
+        assert _spawn_mine(a) is True
+        assert _spawn_mine(b) is False  # a is live: b waits
+        assert popen.call_count == 1
+
+        _pid_file_for_cmd(a).unlink()  # a finished
+        _time.sleep(0.01)
+        assert _spawn_mine(c) is True
+        assert popen.call_args.args[0] == b  # oldest first
+        assert [json.loads(p.read_text()) for p in (tmp_path / "mine_pending").glob("*.json")] == [c]

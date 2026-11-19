@@ -399,7 +399,11 @@ def _mine_already_running(cmd: list[str]) -> bool:
     - the configured mine timeout is > 0 AND the process has been running
       longer than the timeout.
     """
-    pid_file = _pid_file_for_cmd(cmd)
+    return _slot_live(_pid_file_for_cmd(cmd))
+
+
+def _slot_live(pid_file: Path) -> bool:
+    """Whether a PID slot names a live, not timed-out process."""
     try:
         recorded = pid_file.read_text().strip()
     except OSError:
@@ -492,6 +496,30 @@ def _claim_mine_slot(cmd: list[str]) -> Optional[Path]:
         return None
 
 
+def _next_palace_mine(cmd: list) -> Optional[list]:
+    """One mine for the whole palace at a time: every mine takes the palace
+    writer lock, so a second one only waits on it. While any mine or diary
+    checkpoint is live, park ``cmd`` (one file per target, so repeats collapse)
+    and return None; otherwise return the oldest parked mine, parking ``cmd``
+    behind it. Later hook fires drain the queue, so every target is mined.
+    """
+    pending = _MINE_PID_DIR.with_name("mine_pending")
+    pending.mkdir(parents=True, exist_ok=True)
+    (pending / _pid_file_for_cmd(cmd).with_suffix(".json").name).write_text(json.dumps(cmd))
+    # shortcut: check-then-spawn can race two hook fires into two mines; the palace lock still serialises them.
+    if any(_slot_live(p) for p in _MINE_PID_DIR.glob("*.pid")):
+        _log(f"Queued mine behind a running one ({' '.join(cmd[-3:])})")
+        return None
+    for path in sorted(pending.glob("*.json"), key=lambda p: p.stat().st_mtime):
+        try:
+            nxt = json.loads(path.read_text())
+            path.unlink()
+            return nxt
+        except (OSError, ValueError):
+            continue
+    return None
+
+
 def _spawn_mine(cmd: list) -> bool:
     """Spawn a mine subprocess if no live mine is already targeting it.
 
@@ -505,6 +533,10 @@ def _spawn_mine(cmd: list) -> bool:
     """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     log_path = STATE_DIR / "hook.log"
+    if "mine" in cmd:
+        cmd = _next_palace_mine(cmd)
+        if cmd is None:
+            return False
     pid_file = _claim_mine_slot(cmd)
     if pid_file is None:
         _log(f"Skipping mine: target already running ({' '.join(cmd[-3:])})")
