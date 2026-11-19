@@ -126,6 +126,39 @@ def test_model_load_is_lazy_and_uses_pinned_revision_bfloat16(monkeypatch):
     }
 
 
+def test_idle_model_unloads_and_reloads(monkeypatch):
+    timers = []
+
+    class Timer:
+        def __init__(self, interval, function):
+            self.interval, self.function = interval, function
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr(threading, "Timer", Timer)
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
+    provider = EmbeddingGemma2EmbeddingFunction(device="cpu")
+    monkeypatch.setattr(provider, "_select_device", lambda torch: "cpu")
+    monkeypatch.setattr(provider, "_load_model_for", lambda device: _FakeModel())
+    assert provider._model is None
+    provider.embed_query("first")
+    first_model = provider._model
+    first_timer = timers[-1]
+    assert first_timer.interval == 900
+    provider.embed_query("second")
+    first_timer.function()  # A cancelled timer can already be waiting on the lock.
+    assert provider._model is first_model
+    timers[-1].function()
+    assert provider._model is None
+    assert provider.embed_query("third")
+    assert provider._model is not first_model
+
+
 def test_document_metadata_title_and_source_basename_prompts(monkeypatch):
     provider, model = _ready_provider(monkeypatch)
     vectors = provider.embed_documents(

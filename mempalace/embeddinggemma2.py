@@ -176,6 +176,7 @@ class EmbeddingGemma2EmbeddingFunction:
         self._unavailable_warned = False
         self._load_lock = threading.Lock()
         self._inference_lock = threading.Lock()
+        self._idle_timer = None
 
     @staticmethod
     def name() -> str:
@@ -533,53 +534,81 @@ class EmbeddingGemma2EmbeddingFunction:
                     self._resolved_device = "cpu"
                     self._empty_mps_cache()  # release the rejected model's blocks
 
+    def _unload_idle(self, timer):
+        with self._inference_lock:
+            if self._idle_timer is not timer:
+                return
+            self._model = self._idle_timer = None
+            self._resolved_device = None
+            import gc
+            import sys
+
+            gc.collect()
+            self._empty_mps_cache()
+            if sys.platform == "darwin":
+                try:
+                    import ctypes
+
+                    ctypes.CDLL(None).malloc_zone_pressure_relief(None, 0)
+                except Exception:  # noqa: BLE001 - best effort
+                    logger.exception("Could not release freed heap pages")
+
     def _encode(self, inputs, *, prompt_name=None, prompt=None):
         if not inputs:
             return []
         with self._inference_lock:
-            # Keep first-load MPS validation and fallback atomic with inference.
-            # Otherwise a second caller could use the MPS model before its
-            # witness has proved the provider healthy.
-            self._load_and_check()
+            if self._idle_timer:
+                self._idle_timer.cancel()
+                self._idle_timer = None
             try:
-                vectors = self._encode_shrinking_on_oom(
-                    inputs, prompt_name=prompt_name, prompt=prompt
-                )
-            except (RuntimeError, EmbeddingOutputError) as exc:
-                if self._resolved_device != "mps":
-                    raise
-                # Decoders also raise RuntimeError for damaged media. Those
-                # inputs cannot be repaired by moving a healthy model to CPU.
-                if not isinstance(exc, EmbeddingOutputError) and not self._is_mps_runtime_error(
-                    exc
-                ):
-                    raise
-                logger.warning(
-                    "EmbeddingGemma 2 MPS inference failed (%s); retrying this batch on CPU",
-                    exc,
-                )
-                warnings.warn(
-                    f"EmbeddingGemma 2 MPS inference failed ({exc}); retrying this batch on CPU.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                self._empty_mps_cache()
-                # Retry exactly once on a temporary CPU model; CPU failures are
-                # deliberately propagated. The MPS model stays primary: a
-                # permanent switch parked a second, multi-GB model in every
-                # later call of a long-lived server.
-                mps_model = self._model
-                try:
-                    self._model = self._load_model_for("cpu")
-                    return self._encode_once(inputs, prompt_name=prompt_name, prompt=prompt)
-                finally:
-                    self._model = mps_model
-            if self._resolved_device == "mps":
-                # torch's MPS caching allocator keeps every encode shape's blocks
-                # forever, so a long-lived server grows without bound (measured
-                # 2.1→10.3 GB over 11 embeds).
-                self._empty_mps_cache()
-            return vectors
+                return self._encode_locked(inputs, prompt_name=prompt_name, prompt=prompt)
+            finally:
+                if self._model is not None:
+                    timer = threading.Timer(900, lambda: self._unload_idle(timer))
+                    timer.daemon = True
+                    self._idle_timer = timer
+                    timer.start()
+
+    def _encode_locked(self, inputs, *, prompt_name=None, prompt=None):
+        # Keep first-load MPS validation and fallback atomic with inference.
+        # Otherwise a second caller could use the MPS model before its
+        # witness has proved the provider healthy.
+        self._load_and_check()
+        try:
+            vectors = self._encode_shrinking_on_oom(inputs, prompt_name=prompt_name, prompt=prompt)
+        except (RuntimeError, EmbeddingOutputError) as exc:
+            if self._resolved_device != "mps":
+                raise
+            # Decoders also raise RuntimeError for damaged media. Those
+            # inputs cannot be repaired by moving a healthy model to CPU.
+            if not isinstance(exc, EmbeddingOutputError) and not self._is_mps_runtime_error(exc):
+                raise
+            logger.warning(
+                "EmbeddingGemma 2 MPS inference failed (%s); retrying this batch on CPU",
+                exc,
+            )
+            warnings.warn(
+                f"EmbeddingGemma 2 MPS inference failed ({exc}); retrying this batch on CPU.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._empty_mps_cache()
+            # Retry exactly once on a temporary CPU model; CPU failures are
+            # deliberately propagated. The MPS model stays primary: a
+            # permanent switch parked a second, multi-GB model in every
+            # later call of a long-lived server.
+            mps_model = self._model
+            try:
+                self._model = self._load_model_for("cpu")
+                return self._encode_once(inputs, prompt_name=prompt_name, prompt=prompt)
+            finally:
+                self._model = mps_model
+        if self._resolved_device == "mps":
+            # torch's MPS caching allocator keeps every encode shape's blocks
+            # forever, so a long-lived server grows without bound (measured
+            # 2.1→10.3 GB over 11 embeds).
+            self._empty_mps_cache()
+        return vectors
 
     def embed_documents(self, input: str | list[str], metadatas: Optional[list[dict]] = None):
         texts = _as_texts(input)
