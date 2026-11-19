@@ -3173,3 +3173,16 @@ def test_spawn_mine_runs_one_mine_per_palace_and_queues_the_rest(tmp_path):
         assert _spawn_mine(c) is True
         assert popen.call_args.args[0] == b  # oldest first
         assert [json.loads(p.read_text()) for p in (tmp_path / "mine_pending").glob("*.json")] == [c]
+
+
+def test_agent_transcript_is_never_mined(tmp_path, monkeypatch):
+    from mempalace import hooks_cli
+    agent = tmp_path / "agent.jsonl"
+    agent.write_text('{"type":"user","turnOrigin":"sdk","message":{"content":"' + "x" * 200 + '"}}\n')
+    human = tmp_path / "human.jsonl"
+    human.write_text('{"type":"user","turnOrigin":"human","message":{"content":"' + "x" * 200 + '"}}\n')
+    assert hooks_cli._agent_session(agent) is True
+    assert hooks_cli._agent_session(human) is False
+    monkeypatch.setattr(hooks_cli, "_validate_transcript_path", lambda p: Path(p))
+    monkeypatch.setattr(hooks_cli, "MempalaceConfig", lambda: (_ for _ in ()).throw(AssertionError("mined")))
+    hooks_cli._ingest_transcript(str(agent))  # returns before touching config

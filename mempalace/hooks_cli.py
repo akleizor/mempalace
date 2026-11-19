@@ -1353,6 +1353,23 @@ def _save_diary_direct(
     return {"drawers_filed": 0, "messages_folded": 0}
 
 
+def _agent_session(path: Path) -> bool:
+    """True when no user turn in the transcript came from a human (Claude Code's
+    ``turnOrigin``): -p, SDK, subagent and Hive runs. Untagged transcripts count as human."""
+    tagged = False
+    try:
+        with open(path, errors="ignore") as f:
+            for line in f:
+                if '"type":"user"' not in line:
+                    continue
+                if '"turnOrigin":"human"' in line or '"origin":{"kind":"human"}' in line:
+                    return False
+                tagged = tagged or '"turnOrigin":' in line
+    except OSError:
+        return False
+    return tagged
+
+
 def _ingest_transcript(transcript_path: str):
     """Mine a Claude Code session transcript into the palace as a conversation."""
     path = _validate_transcript_path(transcript_path)
@@ -1362,6 +1379,9 @@ def _ingest_transcript(transcript_path: str):
         if not path.is_file() or path.stat().st_size < 100:
             return
     except OSError:
+        return
+    if _agent_session(path):
+        _log(f"skip agent transcript: {path.name}")
         return
 
     try:
