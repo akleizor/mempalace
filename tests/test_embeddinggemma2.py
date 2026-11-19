@@ -697,3 +697,49 @@ def test_embed_media_rejects_unknown_media_type():
     provider = EmbeddingGemma2EmbeddingFunction(modalities="all", device="cpu")
     with pytest.raises(ValueError, match="media_type"):
         provider.embed_media("x", "document")
+
+
+def test_shared_service_embeds_without_loading_a_model(monkeypatch, tmp_path):
+    import json
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.append((self.headers["Authorization"], body))
+            raw = json.dumps({"data": [{"embedding": [3.0, 4.0] + [0.0] * 766} for _ in body["input"]]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        (tmp_path / "token").write_text("secret\n")
+        monkeypatch.setenv("MEMPALACE_EMBEDDING_URL", f"http://127.0.0.1:{server.server_port}/v1/embeddings")
+        monkeypatch.setenv("MEMPALACE_EMBEDDING_TOKEN_FILE", str(tmp_path / "token"))
+        provider = EmbeddingGemma2EmbeddingFunction(device="cpu")
+        monkeypatch.setattr(provider, "_load_model_for", lambda device: pytest.fail("loaded a local model"))
+
+        vector = provider.embed_query(["find this"])[0]
+
+        assert np.allclose(vector[:2], [0.6, 0.8])
+        assert seen[0][0] == "Bearer secret"
+        assert seen[0][1]["prompt_name"] == "SearchQuery" and seen[0][1]["normalize"] is True
+    finally:
+        server.shutdown()
+
+
+def test_shared_service_down_falls_back_to_a_local_model(monkeypatch):
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_URL", "http://127.0.0.1:9/v1/embeddings")
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_TOKEN_FILE", raising=False)
+    provider, fake = _ready_provider(monkeypatch)
+
+    assert len(provider.embed_query(["find this"])) == 1
+    assert fake.calls

@@ -47,6 +47,23 @@ class EmbeddingGemma2OutOfMemoryError(RuntimeError):
     """CUDA ran out of memory even at batch size 1."""
 
 
+def _shared_service() -> Optional[tuple[str, str]]:
+    """(url, token) of a shared EmbeddingGemma 2 service, so one process on the machine holds the model.
+
+    ``MEMPALACE_EMBEDDING_URL`` / ``MEMPALACE_EMBEDDING_TOKEN_FILE`` first, then
+    ``embedding_url`` / ``embedding_token_file`` in ``config.json``. None embeds in-process.
+    """
+    from .config import MempalaceConfig
+
+    file_config = MempalaceConfig()._file_config
+    url = os.environ.get("MEMPALACE_EMBEDDING_URL") or file_config.get("embedding_url")
+    if not url:
+        return None
+    token_file = os.environ.get("MEMPALACE_EMBEDDING_TOKEN_FILE") or file_config.get("embedding_token_file")
+    token = Path(os.path.expanduser(token_file)).read_text().strip() if token_file else ""
+    return url, token
+
+
 def _first_sentence(exc: BaseException) -> str:
     """The first sentence of an exception's message, on one line.
 
@@ -556,6 +573,12 @@ class EmbeddingGemma2EmbeddingFunction:
     def _encode(self, inputs, *, prompt_name=None, prompt=None):
         if not inputs:
             return []
+        service = _shared_service()
+        if service and all(isinstance(text, str) for text in inputs):
+            try:
+                return self._encode_remote(service, inputs, prompt_name=prompt_name, prompt=prompt)
+            except OSError as exc:  # service down: embed locally rather than fail the write
+                logger.warning("shared embedding service %s unavailable (%s); loading locally", service[0], exc)
         with self._inference_lock:
             if self._idle_timer:
                 self._idle_timer.cancel()
@@ -609,6 +632,22 @@ class EmbeddingGemma2EmbeddingFunction:
             # 2.1→10.3 GB over 11 embeds).
             self._empty_mps_cache()
         return vectors
+
+    def _encode_remote(self, service, inputs, *, prompt_name=None, prompt=None):
+        import json
+        import urllib.request
+
+        import numpy as np
+
+        url, token = service
+        body = {"input": list(inputs), "prompt_name": prompt_name, "prompt": prompt,
+                "normalize": True, "max_seq_length": _CONTEXT_TOKENS, "dimensions": self.dimension}
+        request = urllib.request.Request(
+            url, data=json.dumps(body).encode(), method="POST",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(request, timeout=600) as response:
+            rows = json.load(response)["data"]
+        return self._validate_and_normalize(np.array([row["embedding"] for row in rows]), len(inputs))
 
     def embed_documents(self, input: str | list[str], metadatas: Optional[list[dict]] = None):
         texts = _as_texts(input)
