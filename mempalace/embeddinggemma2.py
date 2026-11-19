@@ -6,11 +6,15 @@ model's distinct task prompts, and document metadata can supply a title.
 
 from __future__ import annotations
 
+import ctypes
+import gc
 import logging
 import math
 import os
 import re
+import sys
 import threading
+from contextlib import contextmanager
 import warnings
 from pathlib import Path, PurePath
 from typing import Any, Optional
@@ -176,6 +180,7 @@ class EmbeddingGemma2EmbeddingFunction:
         self._unavailable_warned = False
         self._load_lock = threading.Lock()
         self._inference_lock = threading.Lock()
+        self._idle_timer = None
 
     @staticmethod
     def name() -> str:
@@ -533,10 +538,36 @@ class EmbeddingGemma2EmbeddingFunction:
                     self._resolved_device = "cpu"
                     self._empty_mps_cache()  # release the rejected model's blocks
 
+    @contextmanager
+    def _idle_after_encode(self):
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+            self._idle_timer = None
+        try:
+            yield
+        finally:
+            if self._model is not None:
+                def unload():
+                    with self._inference_lock:
+                        if self._idle_timer is not timer:
+                            return
+                        self._idle_timer = None
+                        self._model = None
+                        self._resolved_device = None
+                        gc.collect()
+                        self._empty_mps_cache()
+                        if sys.platform == "darwin":
+                            ctypes.CDLL(None).malloc_zone_pressure_relief(None, 0)
+
+                timer = threading.Timer(900, unload)
+                timer.daemon = True
+                self._idle_timer = timer
+                timer.start()
+
     def _encode(self, inputs, *, prompt_name=None, prompt=None):
         if not inputs:
             return []
-        with self._inference_lock:
+        with self._inference_lock, self._idle_after_encode():
             # Keep first-load MPS validation and fallback atomic with inference.
             # Otherwise a second caller could use the MPS model before its
             # witness has proved the provider healthy.

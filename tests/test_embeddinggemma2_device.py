@@ -28,6 +28,7 @@ def _torch(cuda=False, mps=False):
 
     return SimpleNamespace(
         float32="float32",
+        bfloat16="bfloat16",
         cuda=SimpleNamespace(is_available=available(cuda)),
         backends=SimpleNamespace(mps=SimpleNamespace(is_available=available(mps))),
     )
